@@ -53,11 +53,11 @@ class BoqTest(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM v_unchecked").fetchone()[0], 3)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM v_missing_check").fetchone()[0], 0)
 
-    def test_rerun_is_idempotent(self):
+    def test_rerun_keeps_counts_stable(self):
         p = self.pdf([[HEAD, ["1", "RTU-01", "", "set", "2", ""]]])
         boq.analyze_boq(self.db, p, "RevC")
         res = boq.analyze_boq(self.db, p, "RevC")
-        self.assertEqual(res["inserted"], 0)
+        self.assertEqual(res["inserted"], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM engineering_entities").fetchone()[0], 1)
 
     def test_no_header_raises_and_leaves_nothing(self):
@@ -66,13 +66,52 @@ class BoqTest(unittest.TestCase):
             boq.analyze_boq(self.db, p, "RevC")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM evidence_files").fetchone()[0], 0)
 
-    def test_chunk_link_when_page_chunks_exist(self):
+    def test_every_entity_has_chunk_and_citation(self):
+        p = self.pdf([[HEAD, ["1", "RTU-01", "", "set", "2", ""], ["2", "Cable Tray TR-200", "", "m", "5", ""]]])
+        boq.analyze_boq(self.db, p, "RevC")      # 沒先跑 ingest_pdf
+        cids = [r[0] for r in self.db.execute("SELECT chunk_id FROM engineering_entities")]
+        self.assertEqual(len(cids), 2)
+        self.assertNotIn(None, cids)
+        cit = ing.format_citation(self.db, cids[0])
+        self.assertIn("revision=RevC", cit)
+        self.assertIn("page=1", cit)
+        self.assertIn("chunk_sha256=", cit)
+
+    def test_two_tables_same_page_no_id_collision(self):
+        p = self.pdf([[HEAD, ["1", "RTU-01", "", "set", "2", ""], ["2", "RTU-02", "", "set", "3", ""]]], "a.pdf")
+        # 同一頁放兩個 BOQ table
+        q = os.path.join(self.d, "two.pdf")
+        doc = SimpleDocTemplate(q, pagesize=A4)
+        from reportlab.platypus import Spacer
+        doc.build([Table([HEAD, ["1", "RTU-01", "", "set", "2", ""], ["2", "Pump P-100", "", "pc", "1", ""]], style=STYLE),
+                   Spacer(1, 40),
+                   Table([HEAD, ["1", "Valve V-200", "", "pc", "4", ""], ["2", "Fan F-300", "", "pc", "6", ""]], style=STYLE)])
+        res = boq.analyze_boq(self.db, q, "RevC")
+        self.assertEqual((res["rows_found"], res["inserted"]), (4, 4))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM engineering_entities").fetchone()[0], 4)
+        tables = {json.loads(r[0])["table"] for r in self.db.execute("SELECT attributes_json FROM engineering_entities")}
+        self.assertEqual(tables, {1, 2})
+
+    def test_non_boq_table_same_column_count_not_parsed(self):
+        q = os.path.join(self.d, "mix.pdf")
+        doc = SimpleDocTemplate(q, pagesize=A4)
+        from reportlab.platypus import Spacer
+        doc.build([Table([HEAD, ["1", "RTU-01", "", "set", "2", ""]], style=STYLE), Spacer(1, 40),
+                   Table([["Rev", "Date", "By", "Chk", "App", "Note"], ["A", "2024-01-01", "X", "Y", "Z", "first"]], style=STYLE)])
+        res = boq.analyze_boq(self.db, q, "RevC")
+        self.assertEqual(res["rows_found"], 1)
+        self.assertEqual(self.db.execute("SELECT entity_name FROM engineering_entities").fetchall(), [("RTU-01",)])
+        self.assertTrue(any("表頭出現前" in s for s in res["skipped"]))
+
+    def test_rerun_rebuilds_stale_results(self):
         p = self.pdf([[HEAD, ["1", "RTU-01", "", "set", "2", ""]]])
-        rec = ing.new_evidence_record(p, "RevC")
-        eid, _ = ing.insert_evidence(self.db, rec)
-        ing.insert_pdf_chunks(self.db, eid, "page one text"); self.db.commit()
         boq.analyze_boq(self.db, p, "RevC")
-        self.assertIsNotNone(self.db.execute("SELECT chunk_id FROM engineering_entities").fetchone()[0])
+        self.db.execute("UPDATE engineering_entities SET entity_name='WRONG', tag=NULL")   # 模擬舊版解析錯誤
+        self.db.commit()
+        boq.analyze_boq(self.db, p, "RevC")
+        self.assertEqual(self.db.execute("SELECT entity_name, tag FROM engineering_entities").fetchall(),
+                         [("RTU-01", "RTU-01")])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM extracted_chunks").fetchone()[0], 1)  # 舊 chunk 已清
 
 
 if __name__ == "__main__":
